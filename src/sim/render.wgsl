@@ -83,7 +83,19 @@ struct Params {
     fieldThreshold: f32,
     fieldStrength: f32,
 
+    splitInterval: f32,
+    splitChance: f32,
+    splitMinCount: f32,
+    splitImpulse: f32,
+    splitMutation: f32,
+
+    neighbourRef: f32,
+    outline: f32,
+    brownian: f32,
+
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -295,6 +307,7 @@ fn vsParticle(
     @location(1) vel: vec2f,
     @location(2) sp: f32,
     @location(3) blob: u32,
+    @location(4) nbr: u32,
 ) -> VSOut {
     // 4-vertex triangle-strip quad: (-1,-1) (1,-1) (-1,1) (1,1)
     let corner = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2.0 - 1.0;
@@ -344,6 +357,11 @@ fn vsParticle(
         out.color = blobColor(blob);
     } else if (mode == 2) {
         out.color = velocityColor(vel);
+    } else if (mode == 3) {
+        // Coordination number. Interior agents are crowded, surface agents are
+        // not — so this draws the skin of a body rather than its bulk.
+        let t = clamp(f32(nbr) / max(P.neighbourRef, 1.0), 0.0, 1.0);
+        out.color = palette(1.0 - t);
     } else {
         out.color = speciesColor(sp);
     }
@@ -436,7 +454,16 @@ fn fsParticle(in: VSOut) -> @location(0) vec4f {
     if (alpha <= 0.004) {
         discard;
     }
-    return vec4f(in.color * alpha, alpha);
+
+    var col = in.color;
+    if (!GLOW_PASS && P.outline > 0.0) {
+        // Darken the outer rim. Dense regions otherwise blend into one flat
+        // mass; a per-agent edge keeps individuals readable without needing a
+        // depth buffer.
+        let edge = smoothstep(0.55, 1.0, length(in.uv));
+        col = col * (1.0 - edge * P.outline);
+    }
+    return vec4f(col * alpha, alpha);
 }
 
 // ------------------------------------------------------- drifting motes ---

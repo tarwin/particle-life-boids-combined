@@ -15,7 +15,23 @@ import {
 import { buildParticles } from './startup.js'
 
 const WORKGROUP = 256
-const PARAM_FLOATS = 64
+/**
+ * Derived from the shader rather than hand-maintained. Growing `struct Params`
+ * in the WGSL and forgetting to grow this constant produces a uniform buffer
+ * that is too small, which invalidates *every* dispatch in the frame — silently,
+ * unless you happen to wrap it in an error scope. Counting the fields here means
+ * the two can never drift.
+ */
+function countParamFields(src) {
+  const m = src.match(/struct Params \{([\s\S]*?)\n\};/)
+  if (!m) throw new Error('could not find struct Params in compute.wgsl')
+  const fields = m[1].match(/^\s*\w+\s*:\s*f32\s*,/gm)
+  if (!fields) throw new Error('no f32 fields found in struct Params')
+  // Uniform structs round up to 16 bytes, i.e. a multiple of 4 floats.
+  return Math.ceil(fields.length / 4) * 4
+}
+
+const PARAM_FLOATS = countParamFields(computeWgsl)
 const PARTICLE_BYTES = 16 // vec2 pos + vec2 vel
 
 // grid = [ counts | offsets | cursor | mediumA | mediumB | blob | blobDensA
@@ -25,12 +41,15 @@ const GRID_REGIONS = 8
 // Reusing hash-cell counts gives a field only `cellsPerRow` across, which is far
 // too coarse to read as a surface. Keep in sync with DSUB in the shaders.
 const DENSITY_SUB = 4
+// Per-blob aggregates: count, sumX, sumY. Keyed by blob id, which is a cell
+// index, so one numCells-sized region each is exactly right.
+const BLOB_STAT_REGIONS = 3
 // Trails accumulate over many frames, so the buffer they live in needs more
 // than 8 bits per channel — at high persistence the per-frame fade step rounds
 // to zero in 8-bit and trails never finish fading, leaving stuck ghosts.
 const ACCUM_FORMAT = 'rgba16float'
-// indices = [ sortedIndices | agentCell | agentBlob ], agentCount each.
-const INDEX_REGIONS = 3
+// indices = [ sortedIndices | agentCell | agentBlob | neighbourCount ].
+const INDEX_REGIONS = 4
 
 // Live shader source. Swapped out by the HMR hook at the bottom of the file so
 // editing a .wgsl rebuilds pipelines in place, keeping the simulation running.
@@ -63,6 +82,7 @@ export class Engine {
     this.currentBuf = 0
     this.frameIndex = 0
     this.mediumFlip = 0
+    this.forceRunSimHalf = null   // benchmark hook; see bench.js
 
     this.paramData = new Float32Array(PARAM_FLOATS)
     this.paramBuffer = device.createBuffer({
@@ -186,15 +206,32 @@ export class Engine {
       blobPropagate: makeCompute('blobPropagate'),
       resolveBlobs: makeCompute('resolveBlobs'),
       mutateSpecies: makeCompute('mutateSpecies'),
+      blobStatsReset: makeCompute('blobStatsReset'),
+      blobStatsAccum: makeCompute('blobStatsAccum'),
+      splitBlobs: makeCompute('splitBlobs'),
     }
 
     // Two specialisations of the neighbour loop from the same source. The
     // discrete one compiles the bilinear species interpolation out entirely,
     // so leaving continuous species switched off costs literally nothing —
     // opt-in in cost, not just in behaviour.
-    this.runSimPipelines = {
-      discrete: makeCompute('runSim', { CONTINUOUS_SPECIES: 0 }),
-      continuous: makeCompute('runSim', { CONTINUOUS_SPECIES: 1 }),
+    // Specialised by two independent axes: whether species are continuous, and
+    // which halves of the blend are actually needed. At mixT 0 or 1 one half of
+    // the neighbour loop is computed and then discarded by `mix()`, so the
+    // extremes get a pipeline with it compiled out.
+    this.runSimPipelines = {}
+    for (const cont of [0, 1]) {
+      for (const [key, boids, plife] of [
+        ['both', 1, 1],
+        ['boids', 1, 0],
+        ['plife', 0, 1],
+      ]) {
+        this.runSimPipelines[`${cont}:${key}`] = makeCompute('runSim', {
+          CONTINUOUS_SPECIES: cont,
+          WANT_BOIDS: boids,
+          WANT_PLIFE: plife,
+        })
+      }
     }
 
     const blend = {
@@ -235,6 +272,11 @@ export class Engine {
         arrayStride: 4,
         stepMode: 'instance',
         attributes: [{ shaderLocation: 3, offset: 0, format: 'uint32' }], // blob
+      },
+      {
+        arrayStride: 4,
+        stepMode: 'instance',
+        attributes: [{ shaderLocation: 4, offset: 0, format: 'uint32' }], // neighbours
       },
     ]
 
@@ -432,7 +474,8 @@ export class Engine {
       // [ counts | offsets | cursor | mediumA | mediumB | blob ]
       grid: make(
         'grid',
-        (this.numCells * GRID_REGIONS + 2 * this.numCells * DENSITY_SUB ** 2) * 4,
+        (this.numCells * (GRID_REGIONS + BLOB_STAT_REGIONS) +
+          2 * this.numCells * DENSITY_SUB ** 2) * 4,
         S | CD | CS
       ),
       // [ sortedIndices | agentCell | agentBlob ]. VERTEX so the render pass can
@@ -603,6 +646,18 @@ export class Engine {
       (p.fieldThresholdMul * this.avgPerCell) / DENSITY_SUB ** 2
     )
     a[61] = p.fieldStrength
+    a[62] = p.splitInterval
+    a[63] = p.splitChance
+    // Like the other thresholds, relative to average occupancy so one setting
+    // means the same thing at any agent count.
+    a[64] = Math.max(2, Math.round(p.splitMinBlobMul * this.avgPerCell))
+    a[65] = p.splitImpulse
+    a[66] = p.splitMutation
+    // The neighbour loop scans a 3x3 block, so this is roughly what a typical
+    // agent sees — the right normaliser for the coordination-number colouring.
+    a[67] = Math.max(1, this.avgPerCell * 9)
+    a[68] = p.outline
+    a[69] = p.brownian ? 1 : 0
     this.device.queue.writeBuffer(this.paramBuffer, 0, a)
   }
 
@@ -647,10 +702,15 @@ export class Engine {
         pass.dispatchWorkgroups(Math.ceil(this.numCells / WORKGROUP))
       }
 
+      // Exactly 0 or 1 means the other half is provably discarded; anything in
+      // between needs both. `forceRunSimHalf` exists so bench.js can pin the
+      // general pipeline at an extreme mixT and measure the specialisation
+      // against an identical workload.
+      const half =
+        this.forceRunSimHalf ??
+        (p.mixT >= 1 ? 'plife' : p.mixT <= 0 ? 'boids' : 'both')
       pass.setPipeline(
-        this.continuousSpecies
-          ? this.runSimPipelines.continuous
-          : this.runSimPipelines.discrete
+        this.runSimPipelines[`${this.continuousSpecies ? 1 : 0}:${half}`]
       )
       pass.dispatchWorkgroups(agentGroups)
 
@@ -695,6 +755,18 @@ export class Engine {
           pass.setPipeline(this.pipelines.mutateSpecies)
           pass.dispatchWorkgroups(agentGroups)
           this.continuousSpecies = true // species are no longer integers
+        }
+
+        // Splitting needs per-blob size and centroid, so the stats pass runs
+        // immediately before it on the same frame's labels.
+        if (p.splitEnabled && this.frameIndex % Math.max(1, p.splitInterval) === 0) {
+          pass.setPipeline(this.pipelines.blobStatsReset)
+          pass.dispatchWorkgroups(cellGroups)
+          pass.setPipeline(this.pipelines.blobStatsAccum)
+          pass.dispatchWorkgroups(agentGroups)
+          pass.setPipeline(this.pipelines.splitBlobs)
+          pass.dispatchWorkgroups(agentGroups)
+          if (p.splitMutation > 0) this.continuousSpecies = true
         }
       }
 
@@ -793,6 +865,7 @@ export class Engine {
     rp.setVertexBuffer(0, this.particleBuffers[this.currentBuf])
     rp.setVertexBuffer(1, this.buffers.species)
     rp.setVertexBuffer(2, this.buffers.indices, this.agentCount * 2 * 4)
+    rp.setVertexBuffer(3, this.buffers.indices, this.agentCount * 3 * 4)
 
     // Halo first so the solid cores sit on top of it.
     if (p.glowStrength > 0) {

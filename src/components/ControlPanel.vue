@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import InteractionMatrix from './InteractionMatrix.vue'
 import {
   AGENT_COUNT_OPTIONS,
@@ -43,6 +43,7 @@ const emit = defineEmits([
   'toggle-pause',
   'randomize-matrix',
   'randomize-all',
+  'locks',
   'edit-matrix',
   'clear-matrix',
   'reroll-seed',
@@ -74,6 +75,43 @@ function nudgeScale(delta) {
   uiScale.value = clampScale(uiScale.value + delta)
   localStorage.setItem(SCALE_KEY, String(uiScale.value))
 }
+
+// -------------------------------------------------------- auto-random ---
+//
+// Lives here rather than in App because the locks it must honour live here.
+
+let autoTimer = null
+
+function restartAutoRandom() {
+  clearInterval(autoTimer)
+  autoTimer = null
+  if (!props.params.autoRandom) return
+  const ms = Math.max(1, props.params.autoRandomSeconds) * 1000
+  autoTimer = setInterval(() => emit('randomize-all', locks.value), ms)
+}
+
+watch(
+  () => [props.params.autoRandom, props.params.autoRandomSeconds],
+  restartAutoRandom,
+  { immediate: true }
+)
+onBeforeUnmount(() => clearInterval(autoTimer))
+
+// ---------------------------------------------------------- fullscreen ---
+//
+// Not persisted: the Fullscreen API can only be entered from a user gesture, so
+// restoring it on load is impossible anyway.
+
+const isFullscreen = ref(false)
+const syncFullscreen = () => { isFullscreen.value = !!document.fullscreenElement }
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen()
+  else document.documentElement.requestFullscreen().catch(() => {})
+}
+
+onMounted(() => document.addEventListener('fullscreenchange', syncFullscreen))
+onBeforeUnmount(() => document.removeEventListener('fullscreenchange', syncFullscreen))
 
 // --------------------------------------------------------------- theme ---
 //
@@ -125,6 +163,10 @@ function toggleLock(key) {
 }
 
 const lockedCount = computed(() => Object.values(locks.value).filter(Boolean).length)
+
+// The keyboard shortcut for Random lives in App, which cannot see these, so
+// publish them upward whenever they change (and once on mount).
+watch(locks, (v) => emit('locks', v), { immediate: true })
 
 // ------------------------------------------------------------- presets ---
 
@@ -235,6 +277,13 @@ function fmt(v, step) {
         </button>
         <button
           class="icon"
+          :title="isFullscreen ? 'Leave fullscreen (F)' : 'Fullscreen (F)'"
+          @click="toggleFullscreen"
+        >
+          {{ isFullscreen ? '⤡' : '⛶' }}
+        </button>
+        <button
+          class="icon"
           :title="theme === 'light' ? 'Switch to dark controls' : 'Switch to light controls'"
           @click="toggleTheme"
         >
@@ -275,7 +324,7 @@ function fmt(v, step) {
           <span class="ico">⌖</span>Reset Cam
         </button>
         <button
-          :title="lockedCount ? `Randomise — ${lockedCount} section(s) locked` : 'Randomise everything'"
+          :title="lockedCount ? `Randomise (Space) — ${lockedCount} section(s) locked` : 'Randomise everything (Space)'"
           @click="emit('randomize-all', locks)"
         >
           <span class="ico">⚄</span>Random{{ lockedCount ? ` ${lockedCount}🔒` : '' }}
@@ -314,6 +363,16 @@ function fmt(v, step) {
             {{ presetNames.includes(presetName.trim()) ? 'Overwrite' : 'Save' }}
           </button>
         </div>
+        <label class="check">
+          <input v-model="params.autoRandom" type="checkbox" />
+          <span>Auto-random</span>
+        </label>
+        <label v-if="params.autoRandom" class="slider">
+          <span class="name">Every</span>
+          <span class="val">{{ params.autoRandomSeconds }}s</span>
+          <input v-model.number="params.autoRandomSeconds" type="range" min="2" max="120" step="1" />
+        </label>
+
         <p v-if="presetNotice" class="notice">{{ presetNotice }}</p>
         <p class="hint">
           Saved to this browser. Selecting one applies it immediately, including
@@ -485,6 +544,16 @@ function fmt(v, step) {
           <span class="val">{{ fmt(params[key], step) }}</span>
           <input v-model.number="params[key]" type="range" :min="min" :max="max" :step="step" />
         </label>
+        <label class="check">
+          <input v-model="params.brownian" type="checkbox" />
+          <span>Per-frame randomness</span>
+        </label>
+        <p class="hint">
+          Off is the original behaviour, where <em>Randomness</em> gives each
+          agent a <em>fixed</em> direction for the whole run — a per-agent bias,
+          not noise. On mixes the frame into the seed, making it real Brownian
+          motion. It changes the feel of every preset, hence the switch.
+        </p>
         <div class="derived">
           <span>Collide radius <b>{{ collisionRadius(params).toFixed(2) }}</b></span>
         </div>
@@ -682,6 +751,46 @@ function fmt(v, step) {
               <input v-model.number="params.mutateInterval" type="range" min="5" max="120" step="5" />
             </label>
           </template>
+          <label class="check" style="margin-top: 8px">
+            <input v-model="params.splitEnabled" type="checkbox" />
+            <span>Split large blobs</span>
+          </label>
+          <template v-if="params.splitEnabled">
+            <label class="slider">
+              <span class="name">Split Every</span>
+              <span class="val">{{ params.splitInterval }}f</span>
+              <input v-model.number="params.splitInterval" type="range" min="20" max="300" step="10" />
+            </label>
+            <label class="slider">
+              <span class="name">Split Chance</span>
+              <span class="val">{{ params.splitChance.toFixed(2) }}</span>
+              <input v-model.number="params.splitChance" type="range" min="0.05" max="1" step="0.05" />
+            </label>
+            <label class="slider">
+              <span class="name">Min Blob Size</span>
+              <span class="val">{{ params.splitMinBlobMul }}×</span>
+              <input v-model.number="params.splitMinBlobMul" type="range" min="2" max="40" step="1" />
+            </label>
+            <label class="slider">
+              <span class="name">Split Force</span>
+              <span class="val">{{ params.splitImpulse }}</span>
+              <input v-model.number="params.splitImpulse" type="range" min="0" max="600" step="10" />
+            </label>
+            <label class="slider">
+              <span class="name">Split Mutation</span>
+              <span class="val">{{ params.splitMutation.toFixed(2) }}</span>
+              <input v-model.number="params.splitMutation" type="range" min="0" max="2" step="0.05" />
+            </label>
+            <p class="hint">
+              Mitosis. A qualifying blob is cut along a random axis through its
+              own centroid and the halves are shoved apart, with their species
+              drifting in <em>opposite</em> directions — so dividing is also
+              speciation. Only blobs above <em>Min Blob Size</em> ever divide,
+              and a blob only gets big by holding together, so size stands in
+              for persistence as a crude fitness signal.
+            </p>
+          </template>
+
           <p class="hint">
             Every agent in a blob gets the <em>same</em> nudge, so a droplet's
             whole lineage drifts together instead of dissolving into noise.
@@ -805,6 +914,11 @@ function fmt(v, step) {
           <input v-model.number="params.trailStrength" type="range" min="0" max="0.99" step="0.01" />
         </label>
         <label class="slider">
+          <span class="name">Outline</span>
+          <span class="val">{{ params.outline.toFixed(2) }}</span>
+          <input v-model.number="params.outline" type="range" min="0" max="1" step="0.05" />
+        </label>
+        <label class="slider">
           <span class="name">Motion Stretch</span>
           <span class="val">{{ params.velocityStretch.toFixed(1) }}</span>
           <input v-model.number="params.velocityStretch" type="range" min="0" max="50" step="0.25" />
@@ -812,7 +926,9 @@ function fmt(v, step) {
         <p class="hint">
           Glow is a second additive pass — halos sum where they overlap, so
           dense regions bloom. <em>Motion Stretch</em> scales each agent along
-          its velocity, turning fast ones into streaks.
+          its velocity, turning fast ones into streaks. <em>Outline</em>
+          darkens each agent's rim so dense regions stay readable instead of
+          saturating into one flat mass.
           <em>Trails</em> keeps part of the previous frame instead of clearing,
           so agents smear a decaying path behind them — at 0.99 a trail lasts
           around a hundred frames. It is screen-space, so panning smears too.
@@ -863,10 +979,10 @@ function fmt(v, step) {
           <span>Show spatial grid</span>
         </label>
         <p class="hint">
-          Drag to pan · scroll to zoom at cursor · <kbd>Space</kbd> pause ·
-          <kbd>R</kbd> restart · <kbd>G</kbd> grid · <kbd>M</kbd> medium ·
+          Drag to pan · scroll to zoom at cursor · <kbd>Space</kbd> random ·
+          <kbd>P</kbd> pause · <kbd>R</kbd> restart · <kbd>G</kbd> grid · <kbd>M</kbd> medium ·
           <kbd>V</kbd> excluded volume · <kbd>C</kbd> reset cam ·
-          <kbd>H</kbd> hide panel
+          <kbd>F</kbd> fullscreen · <kbd>H</kbd> hide panel
         </p>
       </section>
     </div>

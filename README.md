@@ -24,11 +24,13 @@ Requires a WebGPU-capable browser: Chrome/Edge 113+, Safari 26+, or Firefox 141+
 | --- | --- |
 | Drag | Pan camera |
 | Scroll | Zoom, anchored to the point under the cursor |
-| `Space` | Pause / resume |
+| `Space` | Randomise |
+| `P` | Pause / resume |
 | `R` | Restart |
 | `G` | Toggle spatial grid |
 | `M` | Toggle the medium |
 | `V` | Toggle excluded volume |
+| `F` | Fullscreen |
 | `B` | Toggle blob detection |
 | `X` | Cycle colour mode |
 | `C` | Reset camera |
@@ -322,10 +324,28 @@ the walk unbiased and bounded, and its stationary distribution is uniform. With
 it, the fraction sitting at the extremes held flat at 7.9% over 8,000 frames
 while distinct species values grew from 10 to ~4,300.
 
-This is drift, not evolution — there is no fitness. The interesting version is
-in TODO: only splitting blobs that survive past an age threshold makes
-*persistence* the fitness signal, and that is selection rather than a random
-walk. Splitting itself is not built.
+### Splitting
+
+Blobs above a size threshold divide: cut along a random axis through the blob's
+own centroid, the two halves shoved apart with opposite impulses, and their
+species drifting in **opposite** directions — so a division is also a
+speciation event.
+
+Measured, with everything else held constant: splitting off, species stay at
+exactly 10 distinct and 0% non-integer; splitting on, they reach 46 distinct
+and 78% non-integer while the blob count oscillates as droplets divide and
+re-merge.
+
+Per-blob count and centroid come from three `grid` regions keyed by blob id
+(which is a cell index, so the sizing is exact). Positions are summed as 8-bit
+fractions of the world — coarse, but a centroid needs only cell-scale accuracy
+and it keeps the sum inside a u32 even at 1.6M agents.
+
+The only selection pressure is the size threshold: a blob must grow big to
+qualify, and it only grows big by holding together. That is persistence-as-
+fitness in its crudest form. Tracking real blob *age* would be better and is
+still unbuilt — labels are recomputed on each reflood and can change, so it
+needs blobs to be matched between floods.
 
 ## Look
 
@@ -334,8 +354,17 @@ simulation. All of it lives under *View*.
 
 **Colour By** switches what the agent colour *means*: **Species** (default),
 **Blob** (hashed hue per connected component — ids are cell indices, so they
-must be hashed or neighbouring blobs shade identically), or **Velocity**
-(direction as hue, speed as brightness — the standard optical-flow reading).
+must be hashed or neighbouring blobs shade identically), **Velocity**
+(direction as hue, speed as brightness — the standard optical-flow reading), or
+**Neighbours**.
+
+*Neighbours* is the coordination number, which `runSim` already computes for
+the boids averages and used to throw away. Writing it out costs one store and
+draws the **skin** of a body rather than its bulk: interior agents are crowded,
+surface agents are not. Counts range from 1 to ~2000 in a typical state.
+
+**Outline** darkens each agent's rim. Dense regions otherwise saturate into one
+flat mass; a per-agent edge keeps individuals readable without a depth buffer.
 
 **Palette** is the ramp that meaning is drawn with:
 

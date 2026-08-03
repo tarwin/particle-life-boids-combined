@@ -108,6 +108,7 @@ export const RENDER_MODES = [
   ['Species', 'Hue by species. Continuous, so agents between basis species blend.'],
   ['Blob', 'Hue by connected-component id, hashed so adjacent blobs differ.'],
   ['Velocity', 'Direction as hue, speed as brightness — the optical-flow reading.'],
+  ['Neighbours', 'Coordination number — draws the skin of a body rather than its bulk.'],
 ]
 
 export const START_METHODS = [
@@ -140,6 +141,9 @@ export function defaultParams() {
 
     // force adjustments
     movementRandomness: 0.01,
+    // Off keeps the Godot behaviour, where Randomness is a fixed per-agent
+    // bias. On makes it genuine per-frame Brownian noise.
+    brownian: false,
     movementScaling: 1.0,
     forceSofteningMul: 3.0,
     centerAttraction: 0.0,
@@ -198,6 +202,14 @@ export function defaultParams() {
     mutateBias: 0,        // outward push, as a fraction of the rate
     mutateInterval: 30,   // frames between mutation steps
 
+    // splitting — mitosis for blobs. Needs blob detection.
+    splitEnabled: false,
+    splitInterval: 90,      // frames between split events
+    splitChance: 0.35,      // per qualifying blob, per event
+    splitMinBlobMul: 8,     // min blob size, in multiples of average occupancy
+    splitImpulse: 120,      // how hard the halves are pushed apart
+    splitMutation: 0.25,    // species drift, opposite per half
+
     // rendering
     // These two were App-level refs; they live here so a saved configuration
     // captures them like every other visual setting.
@@ -218,6 +230,9 @@ export function defaultParams() {
     glowStrength: 0,
     glowSize: 3.0,
     velocityStretch: 0,
+    // Darkened rim per agent. Cheap depth: dense regions otherwise saturate
+    // into one flat mass.
+    outline: 0,
     // Visual size only. Multiplies drawRadius for rendering and nothing else —
     // drawRadius itself also feeds collisionRadius, so scaling it directly
     // would change the simulation, which a "make it bigger" control should not.
@@ -235,6 +250,10 @@ export function defaultParams() {
     driftSize: 26,
     driftSpeed: 0.004,
     driftBrightness: 0.5,
+
+    // auto-random: reroll on a timer, honouring the same section locks
+    autoRandom: false,
+    autoRandomSeconds: 20,
 
     // camera
     cameraX: 0,

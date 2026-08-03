@@ -97,7 +97,8 @@ into the same limit on some backends.
 
 Adding or reordering a parameter means editing **all three**, in sync:
 
-1. `engine.js` — `PARAM_FLOATS` (currently 56) and the `#writeParams()` body
+1. `engine.js` — `#writeParams()`. `PARAM_FLOATS` is **derived from the shader
+   source** by `countParamFields()`, so that half of the problem is gone
 2. `compute.wgsl` — `struct Params`
 3. `render.wgsl` — `struct Params` (a full duplicate)
 
@@ -106,15 +107,29 @@ it silently reads garbage, and the symptom is usually "the simulation looks
 subtly wrong" rather than a crash. The `_pad*` slots at the end are free space
 for exactly this reason; use them before growing the struct.
 
-`PARAM_FLOATS = 56` → 224 bytes, comfortably under the 64 KiB uniform limit,
-so growing it is fine — just grow it everywhere, and keep the total a multiple
-of 4 floats so the struct stays 16-byte aligned. One `_pad` slot is free.
+Currently 70 fields → 72 floats → 288 bytes, comfortably under the 64 KiB
+uniform limit. Growing it is fine; the count rounds up to a multiple of 4 floats
+so the struct stays 16-byte aligned.
 
-Growing it in one file and not the others is the single most common mistake
-here, and the symptom is unmistakable once you know it: *"Buffer 'params' bound
-with size N is too small, the pipeline requires M"*. Under HMR you will see it
-transiently while the edits land; if it persists after a reload, a file was
-missed.
+**The two WGSL copies must still be kept in sync by hand**, and `#writeParams()`
+must write the right slots. Only the JS constant is now automatic.
+
+The symptom of a mismatch is *"Buffer 'params' bound with size N is too small,
+the pipeline requires M"* — and it is far nastier than it looks:
+
+- It invalidates **every dispatch in the frame**, not just the one named. The
+  simulation appears to run (the render pass still draws the last good state)
+  while nothing computes. I lost a long debugging session to this, checking
+  shader logic, buffer offsets and dispatch conditions in turn, because the
+  failure looks like "my new pass does not write" rather than "nothing works".
+- It logs once per invalid submit, so at 120fps it produces **thousands of
+  console messages a second**. That flood wedged the renderer and then the
+  whole GPU process — `requestAdapter()` stopped resolving in *every* tab, and
+  only a browser restart brought WebGPU back.
+
+If a new compute pass mysteriously does nothing, wrap a frame in
+`device.pushErrorScope('validation')` / `popErrorScope()` **first**. That would
+have found it in one step.
 
 ---
 
@@ -232,6 +247,33 @@ things to preserve:
 The Ring patterns are seed-independent by construction — their layout comes from
 the agent index alone. That is correct, not a bug, and it is a useful canary: if
 Ring positions ever start varying with the seed, a stream has been crossed.
+
+## 6c. Benchmarking — use `bench.js`
+
+Four separate measurements in this project were wrong before the harness
+existed, two of them by enough to invert the conclusion. The failure is always
+that the thing being measured moves while you measure it:
+
+- **The simulation evolves**, so "measure A, then measure B" compares two
+  different workloads. Interleave.
+- **Absolute times drift ~3x within a single run** as structure forms. So even
+  interleaved, compare **paired per-round ratios**, not pooled medians.
+- **rAF is throttled** when the window is not visible. Drive `engine.frame()`.
+- **GPU clocks differ between page loads.** Never compare across sessions.
+
+- **`settle` is never long enough by default.** A pure-boids state kept
+  clustering for thousands of frames; its first two rounds ran an order of
+  magnitude faster than the rest and reported a 30%-faster change as 54%
+  *slower*. `discardRounds` drops the opening rounds for this reason — raise it
+  if the early absolute times look nothing like the later ones.
+
+Two more traps that are specific to this codebase:
+
+- `resolveCollide` is a deliberate race, so the simulation is **not
+  bit-deterministic**. Do not verify anything by expecting two identical runs
+  to match; I wasted a cycle "disproving" a working feature that way.
+- Ring is the only starting pattern whose layout has no randomness. `bench.js`
+  uses Ring + Lock matrix for exactly that reason.
 
 ## 7. WGSL portability constraints I hit
 

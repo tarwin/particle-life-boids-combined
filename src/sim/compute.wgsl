@@ -90,7 +90,19 @@ struct Params {
     fieldThreshold: f32,
     fieldStrength: f32,
 
+    splitInterval: f32,
+    splitChance: f32,
+    splitMinCount: f32,
+    splitImpulse: f32,
+    splitMutation: f32,
+
+    neighbourRef: f32,
+    outline: f32,
+    brownian: f32,
+
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct Particle {
@@ -126,6 +138,13 @@ override BLUR_A_TO_B: bool = true;
 // Which way the *density* blur reads/writes, same trick as above.
 override DENS_1_TO_0: bool = true;
 
+// TODO 1e. At the extremes of the boids<->particle-life blend, half the inner
+// loop's work is computed and then thrown away by `mix()`. These let the two
+// halves be compiled out entirely for a pure-boids or pure-particle-life
+// dispatch, rather than branched around per neighbour.
+override WANT_BOIDS: bool = true;
+override WANT_PLIFE: bool = true;
+
 // ---------------------------------------------------------------- helpers ---
 
 // GLSL-style mod: result always has the sign of y (unlike WGSL's %).
@@ -149,10 +168,36 @@ fn safeNormalize(v: vec2f) -> vec2f {
     return vec2f(0.0);
 }
 
+// The Godot original seeds from the agent id alone, which makes the Randomness
+// slider a *fixed per-agent bias* rather than noise — every agent gets its own
+// constant nudge for the whole run. Mixing the frame in turns it into real
+// Brownian motion. Off by default because it changes the feel of every existing
+// preset, which is exactly why it was only flagged and not fixed for so long.
 fn randomDir(id: u32, scale: f32) -> vec2f {
-    let seed = id * 1664525u + 1013904223u;
+    var seed = id * 1664525u + 1013904223u;
+    if (P.brownian > 0.5) {
+        seed = seed ^ (u32(P.frame) * 2654435761u);
+        seed = seed * 1664525u + 1013904223u;
+    }
     let ang = f32(seed % 6283u) * 0.001;
     return vec2f(cos(ang), sin(ang)) * scale;
+}
+
+// Integer hash. WGSL has no forward declarations, so shared helpers live
+// above their first use.
+fn hashU32(xIn: u32) -> u32 {
+    var x = xIn;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Uniform in [-1, 1].
+fn hashSigned(x: u32) -> f32 {
+    return f32(hashU32(x) % 2048u) / 1024.0 - 1.0;
 }
 
 // Shortest delta across a wrapping (toroidal) world.
@@ -508,6 +553,100 @@ fn resolveBlobs(@builtin(global_invocation_id) gid: vec3u) {
     indices[2u * n + id] = atomicLoad(&grid[blobBase() + indices[n + id]]);
 }
 
+// -------------------------------------------------------- blob splitting ---
+//
+// Mitosis. A blob is cut along a random axis through its own centroid and the
+// two halves are pushed apart with opposite impulses, while their species drift
+// in opposite directions — so a division is also a speciation event.
+//
+// Selection, such as it is, comes from the size threshold: only blobs that grew
+// big enough to qualify ever divide, and a blob only gets big by holding
+// together. That is the "persistence as fitness" idea in its cheapest form.
+//
+// Per-blob aggregates live in three numCells-sized regions, keyed by blob id
+// (which *is* a cell index, so the sizing works out exactly).
+
+fn blobCountBase() -> u32 { let d = 2u * u32(P.numCells) * DSUB * DSUB; return 8u * u32(P.numCells) + d; }
+fn blobSumXBase() -> u32 { return blobCountBase() + u32(P.numCells); }
+fn blobSumYBase() -> u32 { return blobCountBase() + 2u * u32(P.numCells); }
+
+// Positions are summed as 8-bit fractions of the world. Coarse, but a centroid
+// only needs cell-scale accuracy, and it keeps the sum inside u32 even at
+// 1.6M agents (1.6e6 * 255 = 4.1e8).
+const POS_QUANT: f32 = 255.0;
+
+@compute @workgroup_size(WG)
+fn blobStatsReset(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= u32(P.numCells)) { return; }
+    atomicStore(&grid[blobCountBase() + idx], 0u);
+    atomicStore(&grid[blobSumXBase() + idx], 0u);
+    atomicStore(&grid[blobSumYBase() + idx], 0u);
+}
+
+@compute @workgroup_size(WG)
+fn blobStatsAccum(@builtin(global_invocation_id) gid: vec3u) {
+    let id = gid.x;
+    let n = u32(P.agentsCount);
+    if (id >= n) { return; }
+    let blob = indices[2u * n + id];
+    if (blob == BLOB_NONE) { return; }
+
+    let world = P.worldSize;
+    let half = world * 0.5;
+    let p = outParticles[id].pos;
+    let qx = u32(clamp(fmodp(p.x + half, world) / world, 0.0, 1.0) * POS_QUANT);
+    let qy = u32(clamp(fmodp(p.y + half, world) / world, 0.0, 1.0) * POS_QUANT);
+
+    atomicAdd(&grid[blobCountBase() + blob], 1u);
+    atomicAdd(&grid[blobSumXBase() + blob], qx);
+    atomicAdd(&grid[blobSumYBase() + blob], qy);
+}
+
+@compute @workgroup_size(WG)
+fn splitBlobs(@builtin(global_invocation_id) gid: vec3u) {
+    let id = gid.x;
+    let n = u32(P.agentsCount);
+    if (id >= n) { return; }
+
+    let blob = indices[2u * n + id];
+    if (blob == BLOB_NONE) { return; }
+
+    let count = atomicLoad(&grid[blobCountBase() + blob]);
+    if (count < u32(P.splitMinCount)) { return; }
+
+    // One decision per blob per epoch, taken identically by every agent in it.
+    let epoch = u32(P.frame) / max(u32(P.splitInterval), 1u);
+    let roll = hashU32(blob * 2246822519u + epoch);
+    if (f32(roll % 10000u) / 10000.0 > P.splitChance) { return; }
+
+    // Centroid, back out of the quantised sums.
+    let world = P.worldSize;
+    let half = world * 0.5;
+    let inv = 1.0 / (f32(count) * POS_QUANT);
+    let cx = f32(atomicLoad(&grid[blobSumXBase() + blob])) * inv * world - half;
+    let cy = f32(atomicLoad(&grid[blobSumYBase() + blob])) * inv * world - half;
+
+    // A random cut plane through it, stable for this blob and epoch.
+    let ang = f32(hashU32(blob * 668265263u + epoch) % 62832u) * 0.0001;
+    let axis = vec2f(cos(ang), sin(ang));
+
+    // Which half am I? Toroidal, so the blob can straddle the world edge.
+    let d = toroidalDiff(vec2f(cx, cy), outParticles[id].pos, vec2f(world));
+    let side = select(-1.0, 1.0, dot(d, axis) >= 0.0);
+
+    // Shove the halves apart, and let them speciate in opposite directions.
+    outParticles[id].vel += axis * (side * P.splitImpulse);
+
+    let maxIdx = max(P.speciesCount - 1.0, 0.0);
+    if (maxIdx > 0.0 && P.splitMutation > 0.0) {
+        let period = 2.0 * maxIdx;
+        var v = fmodp(species[id] + side * P.splitMutation, period);
+        if (v > maxIdx) { v = period - v; }
+        species[id] = v;
+    }
+}
+
 // ------------------------------------------------------------- mutation ---
 //
 // Random drift in species space, per blob. Every agent in a blob is given the
@@ -519,21 +658,6 @@ fn resolveBlobs(@builtin(global_invocation_id) gid: vec3u) {
 // middle of the species range and stay there. `mutateBias` pushes back
 // outwards, which keeps the population spread out and interesting to look at.
 // Real selection arrives when blob *persistence* gates splitting — see TODO.
-
-fn hashU32(xIn: u32) -> u32 {
-    var x = xIn;
-    x ^= x >> 16u;
-    x *= 0x7feb352du;
-    x ^= x >> 15u;
-    x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
-}
-
-// Uniform in [-1, 1].
-fn hashSigned(x: u32) -> f32 {
-    return f32(hashU32(x) % 2048u) / 1024.0 - 1.0;
-}
 
 @compute @workgroup_size(WG)
 fn mutateSpecies(@builtin(global_invocation_id) gid: vec3u) {
@@ -698,14 +822,14 @@ fn runSim(@builtin(global_invocation_id) gid: vec3u,
                 var dist = length(diff);
                 if (dist < 0.0001) { dist = 0.0001; }
 
-                if (dist < P.boidVisionRadius) {
+                if (WANT_BOIDS && dist < P.boidVisionRadius) {
                     neighborCount++;
                     align += inParticles[i].vel;
                     coh += pos + diff;
                     sep -= diff / (dist * dist);
                 }
 
-                if (dist < P.speciesInteractionRadius) {
+                if (WANT_PLIFE && dist < P.speciesInteractionRadius) {
                     var f = 0.0;
                     if (CONTINUOUS_SPECIES) {
                         // Bilinear across the four surrounding matrix entries:
@@ -812,6 +936,11 @@ fn runSim(@builtin(global_invocation_id) gid: vec3u,
 
     outParticles[id].pos = pos;
     outParticles[id].vel = vel;
+
+    // The neighbour count is already computed for the boids averages; writing
+    // it out costs one store and is what lets the renderer draw a droplet's
+    // *surface* — interior agents have many neighbours, skin agents few.
+    indices[3u * agentCount + id] = u32(max(neighborCount, 0));
 }
 
 @compute @workgroup_size(WG)

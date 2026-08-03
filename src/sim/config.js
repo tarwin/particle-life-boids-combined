@@ -180,7 +180,7 @@ export function randomConfig(locked = {}, rand = Math.random) {
 
   if (on('view')) {
     // Free rein — none of it can break the simulation.
-    params.renderMode = chance(0.75) ? 0 : pick([1, 2])
+    params.renderMode = chance(0.7) ? 0 : pick([1, 2, 3])
     params.particleShape = Math.floor(rnd(0, 8))
     params.speciesPalette = Math.floor(rnd(0, 14))
     params.background = chance(0.85) ? Math.floor(rnd(0, 11)) : Math.floor(rnd(11, 14))
@@ -189,6 +189,7 @@ export function randomConfig(locked = {}, rand = Math.random) {
     params.velocityStretch = chance(0.6) ? 0 : snap(rnd(1, 30), 0.25)
     params.drawScale = snap(rnd(0.6, 3), 0.1)
     params.drawJitter = chance(0.5) ? 0 : snap(rnd(0.1, 0.8), 0.05)
+    params.outline = chance(0.6) ? 0 : snap(rnd(0.2, 0.8), 0.05)
     params.trailStrength = chance(0.7) ? 0 : snap(rnd(0.5, 0.95), 0.01)
     // The fluid look is striking but takes over the image, so it stays occasional.
     params.fieldMode = chance(0.8) ? 0 : pick([1, 2])

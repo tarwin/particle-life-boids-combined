@@ -173,9 +173,12 @@ function onApplyConfig(cfg) {
   }
 }
 
+let lastLocks = {}
+
 function randomizeAll(locks = {}) {
   const e = engine.value
   if (!e) return
+  lastLocks = locks
   const seed = advanceSeed(locks)
   const { params: rp, startup: rs, needsRestart, rerollMatrix } = randomConfig(
     locks,
@@ -348,7 +351,11 @@ function onKey(ev) {
   if (showAbout.value || showConfig.value) return
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return
   if (ev.code === 'Space') {
+    // Space is the "show me something else" key — the one you press over and
+    // over. Pause moved to P.
     ev.preventDefault()
+    randomizeAll(lastLocks)
+  } else if (ev.code === 'KeyP') {
     togglePause()
   } else if (ev.code === 'KeyR') {
     restart()
@@ -358,6 +365,10 @@ function onKey(ev) {
     params.mediumEnabled = !params.mediumEnabled
   } else if (ev.code === 'KeyV') {
     params.coreEnabled = !params.coreEnabled
+  } else if (ev.code === 'KeyF') {
+    // Keydown counts as a user gesture, so the Fullscreen API allows this.
+    if (document.fullscreenElement) document.exitFullscreen()
+    else document.documentElement.requestFullscreen().catch(() => {})
   } else if (ev.code === 'KeyB') {
     params.blobsEnabled = !params.blobsEnabled
     if (params.blobsEnabled) params.renderMode = 1
@@ -426,6 +437,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       @randomize-matrix="randomizeMatrix"
       @reroll-seed="rerollSeed"
       @randomize-all="randomizeAll"
+      @locks="lastLocks = $event"
       @edit-matrix="onMatrixEdit"
       @clear-matrix="clearMatrix"
       @reset-camera="resetCamera"

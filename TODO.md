@@ -64,8 +64,23 @@ radius of 250.
 - The giant-component worry is mostly real physics, not a labelling bug: with
   the medium on, droplets label cleanly and separately.
 
-**Splitting is still not built** — that is what remains of this section, and it
-is where the interesting part lives (see 2b).
+**Splitting (was 2b) is now built** too — mitosis, verified: with it off,
+species stay at exactly 10 distinct and 0% non-integer; with it on they reach
+46 distinct and 78% non-integer, and blob count oscillates as droplets divide
+and re-merge. A blob is cut along a random axis through its own centroid, the
+halves get opposite impulses, and their species drift in opposite directions,
+so dividing is also speciation.
+
+Per-blob aggregates (count, sumX, sumY) live in three numCells-sized `grid`
+regions keyed by blob id — which *is* a cell index, so the sizing is exact.
+Positions are summed as 8-bit fractions of the world, coarse but plenty for a
+centroid and it keeps the sum inside u32 even at 1.6M agents.
+
+Selection is only the size threshold: a blob has to grow big to qualify, and it
+only grows big by holding together. Proper blob *age* tracking is still
+unbuilt, and is what would turn this from "big blobs divide" into real
+persistence-as-fitness — labels are recomputed each reflood and can change, so
+it needs blob matching between floods.
 
 **Continuous species** is done. It landed as designed — `species` is
 an `f32`, the matrix lookup is a proper bilinear across the four surrounding
@@ -91,6 +106,9 @@ Two corrections to the sketch above:
 ---
 
 ## 1. Optimisations
+
+**Read `src/sim/bench.js` before touching any of this.** Its header documents
+the four ways a measurement here goes wrong; all four have bitten this project.
 
 > "Are there extra optimisations we could do? Other grid formats that would
 > speed things up? Optimisations to do with number accuracy (f16 vs 32 vs 4)?"
@@ -161,13 +179,27 @@ grid buffer size at restart. Options:
 
 ### 1e. Free-ish wins
 
-- The `if (i == id) continue;` branch runs for every neighbour to skip one
+- ~~Two specialised pipeline variants selected by mixT~~ **Built.** `WANT_BOIDS`
+  and `WANT_PLIFE` override constants compile the unused half of the neighbour
+  loop out at the extremes. `runSim` is now six pipelines: continuous-species
+  x {both, boids, plife}. Measured:
+  - **mixT = 1 (pure particle life): −17.5%**, −11% to −22% across five paired
+    rounds at 25,600 agents.
+  - **mixT = 0 (pure boids): −24% to −31%** on the settled rounds at 15,360
+    agents. Reported as a range rather than a single figure because pure boids
+    keeps clustering for thousands of frames, so the early rounds measure a much
+    lighter workload — which is what `discardRounds` now exists for.
+- The `if (i == id) continue;` branch still runs for every neighbour to skip one
   agent. Cheaper to let it happen and rely on `dist < 0.0001` clamping, or to
-  subtract self-contribution afterwards.
-- `sep -= diff / (dist*dist)` and the boids accumulators run even when
-  `mixT == 1.0` (pure particle life), where the result is discarded by `mix()`.
-  Same in reverse at `mixT == 0`. Two specialised pipeline variants selected by
-  mixT would skip half the inner-loop math at the extremes.
+  subtract the self-contribution afterwards. Untried.
+
+**Measure with `bench.js`, not by hand.** Every casual measurement in this
+project has been wrong, twice by enough to invert the conclusion. The harness
+interleaves variants on one settled state and reports **paired per-round
+ratios** — absolute times drift 3x within a single run as the simulation
+settles, so a pooled median is not trustworthy. `engine.forceRunSimHalf` exists
+so the general pipeline can be pinned at an extreme mixT, making the two sides
+an identical workload.
 
 ---
 
@@ -290,30 +322,22 @@ stretch, and per-agent size + size jitter. Three findings worth keeping:
   agent index speckles randomly; hashing the *species* makes each species read
   as one kind of thing, which is what the eye is looking for.
 
-Still unbuilt from the original list below:
+**Colour By** now offers Species, Blob, Velocity and Neighbours. The last is
+the one worth knowing about: `runSim` already computed the coordination number
+for the boids averages and threw it away, so writing it out costs a single
+store and draws the **skin** of a body rather than its bulk. Measured 1 to
+~2000 neighbours with ~1,650 distinct values, so there is real signal in it.
+It reaches the vertex stage as an instance attribute at an offset into
+`indices` — no storage buffer in the vertex stage.
 
-Species-as-hue burns the entire colour channel on one variable. Alternatives,
-all one-line changes in `vsParticle`:
+Still unbuilt from the original list:
 
-- **Velocity** → hue or brightness. Immediately legible; flocking and vortices
-  become obvious. Direction as hue, magnitude as value, is the classic optical
-  flow look.
-- **Local density** → brightness, from the counts region. Makes cluster cores
-  glow without any extra work.
-- **Neighbour count / coordination number** → this is what actually
-  distinguishes surface agents from interior ones. Would draw the *skin* of
-  a droplet. `runSim` already computes `neighborCount` and throws it away —
-  writing it out would take one buffer region.
-- **Blob ID** → once 2a exists, colour by blob rather than species and the
-  splitting story becomes visible at a glance.
-- **Species as luminance, philicity as hue** — two variables at once.
-
-Worth adding a **palette** choice too: the current blue→cyan→green→yellow→red
-heatmap is high-contrast but garish and not perceptually uniform. Viridis or
-Magma would read better and are the same shape of function. For continuous
-species especially, a **cyclic** palette (HSV wheel) would be better than a
-linear ramp, since species 0 and N-1 are not actually far apart in any
-meaningful sense.
+- **Local density → brightness**, from the counts region. Cheap; would make
+  cluster cores glow. Largely superseded by the density field (3a), which
+  shades the same quantity better, so this is now low value.
+- **Species as luminance, philicity as hue** — two variables at once. Still
+  genuinely unexplored, and the only item here that would show something the
+  current modes cannot.
 
 ### 3d. Trails and motion
 
@@ -337,9 +361,20 @@ Nothing further outstanding in this section.
 ### 3e. Cheap depth
 
 Everything is uniformly flat and additive, so dense regions saturate to white
-and lose all structure. Options: size agents by density, add a subtle dark
-outline per disc so overlapping ones stay distinct, or tone-map the final image
-instead of letting additive blending clip.
+and lose all structure.
+
+- ~~a subtle dark outline per disc~~ **Built** as *Outline*: the outer rim of
+  each agent is darkened by `smoothstep(0.55, 1.0, |uv|)`, so overlapping
+  agents stay individually readable without a depth buffer. Skipped on the glow
+  pass, where a hard edge would defeat the point.
+- **Size agents by density** — unbuilt. The per-agent neighbour count now
+  exists as a vertex attribute, so this is a one-line change in `vsParticle`
+  (scale the radius by it) rather than the buffer work it used to need.
+- **Tone-map the final image** — unbuilt, and the more principled fix. Additive
+  blending clips to white in dense regions and no per-agent trick recovers
+  that. The trails path already renders to an `rgba16float` texture, so the
+  blit is the natural place to put a tone-map curve; doing it for the non-trail
+  path would mean always rendering offscreen.
 
 **Watch out**
 
@@ -354,12 +389,14 @@ instead of letting additive blending clip.
 
 ## Smaller loose ends
 
-- `randomDir()` seeds from `id + workgroup_id` and **not** from `P.frame`, so
-  the "Randomness" slider adds a *fixed per-agent bias* rather than per-frame
-  noise. This matches the Godot original, but it is almost certainly not what
-  the slider is meant to do. Mixing `P.frame` into the seed would make it real
-  Brownian noise. Flagging rather than fixing, since it changes the feel of
-  every existing preset.
+- ~~`randomDir()` seeds from `id + workgroup_id` and not from `P.frame`~~
+  **Fixed, behind a switch** (*Per-frame randomness*, off by default so no
+  existing preset changes). Confirmed by the scaling of RMS displacement with
+  time, which is the honest way to tell the two apart: `randomDir` feeds
+  *acceleration*, so a fixed bias gives displacement proportional to t^2 (4x
+  the time -> 16x, measured 15.5) and real noise gives t^1.5 (-> 8x, measured
+  8.03). Magnitudes differ 24-fold, because a fixed bias accumulates coherently
+  while noise cancels.
 - ~~No save/load of interaction matrices or full configurations.~~ **Done** —
   `config.js` captures params + startup + matrix + philicity + core sizes, the
   JSON dialog round-trips it, and named presets live in localStorage. Two
