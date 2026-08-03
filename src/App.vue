@@ -34,6 +34,13 @@ const ABOUT_KEY = 'plb.hideAbout'
 const params = reactive(defaultParams())
 const startup = reactive(defaultStartup())
 
+// Console access for bench.js (see its header): bench(__engine, __params, ...).
+if (import.meta.env.DEV) {
+  window.__params = params
+  window.__startup = startup
+  window.__restart = () => restart()
+}
+
 const engine = shallowRef(null)
 const error = ref('')
 const notice = ref('')

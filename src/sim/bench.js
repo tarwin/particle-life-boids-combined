@@ -63,6 +63,9 @@ export async function bench(engine, params, startup, opts = {}) {
   // caller on a Ring layout with a locked matrix.
   const beforeParams = { ...params }
   const beforeStartup = { ...startup }
+  // Engine-level benchmark hooks variants may touch; restored alongside.
+  const engineHooks = ['forceRunSimHalf', 'sortedDispatch', 'cellFit', 'cellDivisor', 'cellSizeOverride']
+  const beforeEngine = Object.fromEntries(engineHooks.map((k) => [k, engine[k]]))
 
   // One shared starting state. Everything after this is the same world.
   if (restart) {
@@ -89,7 +92,7 @@ export async function bench(engine, params, startup, opts = {}) {
   } finally {
     Object.assign(params, beforeParams)
     Object.assign(startup, beforeStartup)
-    engine.forceRunSimHalf = null
+    Object.assign(engine, beforeEngine)
     if (restart) restart()
   }
 

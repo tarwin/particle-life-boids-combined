@@ -592,16 +592,29 @@ storage buffers bound in the vertex stage.
 
 ## Performance
 
-Cost is dominated by the neighbour loop, and that loop scans a 3×3 block of hash
-cells. So the thing that matters is **density** — agents per cell — not agent
-count. Doubling the agent count in the same world quadruples the work; doubling
-it while also scaling the world keeps it linear.
+Cost is dominated by the neighbour loop, and that loop scans the block of hash
+cells the current radii need. So the thing that matters is **density** — agents
+per cell — not agent count. Doubling the agent count in the same world
+quadruples the work; doubling it while also scaling the world keeps it linear.
 
 The panel shows `~N neighbours scanned per agent` for exactly this reason. Keep
 it under ~1000 and things stay fast.
 
+Two structural optimisations (TODO 1a/1b) sit under the loop:
+
+- **Sorted dispatch.** `runSim`'s threads process agents in the cell-sorted
+  order the spatial hash already produces, so adjacent threads scan the same
+  cells and the ~225 neighbour reads come out of cache instead of DRAM.
+  Measured **−44%** ms/frame at the 25,600-agent default and **−67%** at
+  102,400 agents (paired interleaved rounds via `bench.js`). Arithmetic-
+  identical to the unsorted order — no switch, always on.
+- **Radius-fitted cells.** The grid cell size tracks the largest radius in use
+  (a live refit that keeps the particles), and the shader widens its scan if a
+  slider outruns the cell — so small radii genuinely cost less (**−36%** at
+  Vision/Sense 100) and no slider setting can miss neighbours.
+
 Apple M-series, measured at matched density (~225 neighbours/agent, start cloud
-filling the world):
+filling the world), **before** the two optimisations above:
 
 | Agents | World | ms/frame | fps |
 | --- | --- | --- | --- |

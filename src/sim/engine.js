@@ -83,6 +83,17 @@ export class Engine {
     this.frameIndex = 0
     this.mediumFlip = 0
     this.forceRunSimHalf = null   // benchmark hook; see bench.js
+    // TODO 1a (cheap half): runSim threads walk the cell-sorted agent order.
+    // Identical simulation either way; off exists only for benchmarking.
+    this.sortedDispatch = true
+    // TODO 1b: fit the hash cell to the radii actually in use instead of the
+    // worst case the sliders can reach. The shader's scan radius is derived
+    // from the same radii, so a stale or pinned cell size is never *wrong*,
+    // only slower. Override and divisor exist for benchmarking: the divisor
+    // trades smaller cells (finer culling) for more cells scanned.
+    this.cellFit = true
+    this.cellDivisor = 1
+    this.cellSizeOverride = null
 
     this.paramData = new Float32Array(PARAM_FLOATS)
     this.paramBuffer = device.createBuffer({
@@ -219,6 +230,8 @@ export class Engine {
     // which halves of the blend are actually needed. At mixT 0 or 1 one half of
     // the neighbour loop is computed and then discarded by `mix()`, so the
     // extremes get a pipeline with it compiled out.
+    // A third axis, sorted dispatch, exists only so bench.js can A/B it — the
+    // unsorted variants are never dispatched outside a benchmark.
     this.runSimPipelines = {}
     for (const cont of [0, 1]) {
       for (const [key, boids, plife] of [
@@ -226,11 +239,14 @@ export class Engine {
         ['boids', 1, 0],
         ['plife', 0, 1],
       ]) {
-        this.runSimPipelines[`${cont}:${key}`] = makeCompute('runSim', {
-          CONTINUOUS_SPECIES: cont,
-          WANT_BOIDS: boids,
-          WANT_PLIFE: plife,
-        })
+        for (const sorted of [0, 1]) {
+          this.runSimPipelines[`${cont}:${key}:${sorted}`] = makeCompute('runSim', {
+            CONTINUOUS_SPECIES: cont,
+            WANT_BOIDS: boids,
+            WANT_PLIFE: plife,
+            SORTED_DISPATCH: sorted,
+          })
+        }
       }
     }
 
@@ -448,7 +464,13 @@ export class Engine {
     this.continuousSpecies = (cfg.speciesSpread ?? 0) > 0
 
     this.worldSize = BASE_SIZE * cfg.worldSizeMult
-    this.cellsPerRow = Math.ceil(this.worldSize / this.cellSize)
+    // Start from the worst-case cell; the first frame() refits to the live
+    // radii. floor + divide, not ceil: cells must tile the world *exactly*,
+    // because the shader's scan bound assumes every cell is full-width — a
+    // narrow partial cell at the edge would let a neighbour hide one cell
+    // further away than ceil(R / cellSize) reaches.
+    this.cellsPerRow = Math.max(1, Math.floor(this.worldSize / CELL_SIZE))
+    this.cellSize = this.worldSize / this.cellsPerRow
     this.numCells = this.cellsPerRow * this.cellsPerRow
     this.maxCollisions = this.#collisionCapacityFor(this.agentCount)
 
@@ -472,12 +494,7 @@ export class Engine {
       // [ speciesCount^2 matrix | philicities | core sizes ]
       matrix: make('matrix', (this.speciesCount + 2) * this.speciesCount * 4, S | CD),
       // [ counts | offsets | cursor | mediumA | mediumB | blob ]
-      grid: make(
-        'grid',
-        (this.numCells * (GRID_REGIONS + BLOB_STAT_REGIONS) +
-          2 * this.numCells * DENSITY_SUB ** 2) * 4,
-        S | CD | CS
-      ),
+      grid: make('grid', this.#gridBytes(), S | CD | CS),
       // [ sortedIndices | agentCell | agentBlob ]. VERTEX so the render pass can
       // bind the blob region directly as an instance attribute at an offset,
       // instead of needing a storage buffer in the vertex stage.
@@ -490,15 +507,32 @@ export class Engine {
       ),
     }
 
-    const b = this.buffers
     this.uploadMatrix(matrix, philicity, sizeSeeds)
+    this.#seedMedium()
+    this.#buildBindGroups()
+  }
 
-    // The medium starts uniformly saturated; agents carve their droplets out of
-    // it. Both ping-pong regions are seeded so the first frame reads real data
-    // whichever way the flip lands.
+  #gridBytes() {
+    return (
+      (this.numCells * (GRID_REGIONS + BLOB_STAT_REGIONS) +
+        2 * this.numCells * DENSITY_SUB ** 2) * 4
+    )
+  }
+
+  /**
+   * The medium starts uniformly saturated; agents carve their droplets out of
+   * it. Both ping-pong regions are seeded so the first frame reads real data
+   * whichever way the flip lands.
+   */
+  #seedMedium() {
     const mediumInit = new Float32Array(this.numCells).fill(1)
-    d.queue.writeBuffer(b.grid, this.numCells * 3 * 4, mediumInit)
-    d.queue.writeBuffer(b.grid, this.numCells * 4 * 4, mediumInit)
+    this.device.queue.writeBuffer(this.buffers.grid, this.numCells * 3 * 4, mediumInit)
+    this.device.queue.writeBuffer(this.buffers.grid, this.numCells * 4 * 4, mediumInit)
+  }
+
+  #buildBindGroups() {
+    const d = this.device
+    const b = this.buffers
 
     this.renderBindGroup = d.createBindGroup({
       layout: this.renderBGL,
@@ -526,6 +560,57 @@ export class Engine {
     // Index i => particle buffer i is the input, the other is the output.
     this.bindGroups = [group(b.particleA, b.particleB), group(b.particleB, b.particleA)]
     this.particleBuffers = [b.particleA, b.particleB]
+  }
+
+  /**
+   * TODO 1b: the cell size the current radii deserve, as a cell count per row.
+   * Cells always divide the world exactly (see the comment in restart()); the
+   * row count is capped so a tiny radius cannot allocate a monster grid, and
+   * clamped to the worst-case CELL_SIZE so the grid never gets *coarser* than
+   * the original fixed layout.
+   */
+  #targetCellsPerRow(p) {
+    let target = this.cellSizeOverride
+    if (!target) {
+      if (!this.cellFit) {
+        target = CELL_SIZE
+      } else {
+        // Same radii the shader's scan bound tests against. At the mixT
+        // extremes the specialised pipelines compile one radius out, so it
+        // does not need to fit either.
+        const half =
+          this.forceRunSimHalf ??
+          (p.mixT >= 1 ? 'plife' : p.mixT <= 0 ? 'boids' : 'both')
+        let maxR = collisionRadius(p)
+        if (p.coreEnabled) maxR = Math.max(maxR, coreRadius(p))
+        if (half !== 'plife') maxR = Math.max(maxR, p.boidVisionRadius)
+        if (half !== 'boids') maxR = Math.max(maxR, p.speciesInteractionRadius)
+        target = Math.min(CELL_SIZE, Math.max(maxR / this.cellDivisor, this.worldSize / 256, 40))
+      }
+    }
+    return Math.min(256, Math.max(1, Math.floor(this.worldSize / target)))
+  }
+
+  /**
+   * Restart-lite: recarve the grid for a new cell size, keeping the particles.
+   * Everything per-cell (medium state, blob labels, aggregates) lives in the
+   * grid buffer and is resolution-dependent, so it is rebuilt rather than
+   * migrated: the medium is reseeded and blob labels refill on the next
+   * reflood. Counts/offsets/cursor are recomputed every frame anyway.
+   */
+  #applyCellSize(cellsPerRow) {
+    this.cellsPerRow = cellsPerRow
+    this.cellSize = this.worldSize / cellsPerRow
+    this.numCells = cellsPerRow * cellsPerRow
+
+    this.buffers.grid.destroy?.()
+    this.buffers.grid = this.device.createBuffer({
+      label: 'grid',
+      size: Math.max(this.#gridBytes(), 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    })
+    this.#seedMedium()
+    this.#buildBindGroups()
   }
 
   /**
@@ -653,9 +738,11 @@ export class Engine {
     a[64] = Math.max(2, Math.round(p.splitMinBlobMul * this.avgPerCell))
     a[65] = p.splitImpulse
     a[66] = p.splitMutation
-    // The neighbour loop scans a 3x3 block, so this is roughly what a typical
-    // agent sees — the right normaliser for the coordination-number colouring.
-    a[67] = Math.max(1, this.avgPerCell * 9)
+    // Roughly what a typical agent sees — the normaliser for the
+    // coordination-number colouring. Fixed to the area the original 3x3 scan
+    // of 500-unit cells covered, NOT the live grid: the fitted cell size (1b)
+    // must not change how an existing render mode looks.
+    a[67] = Math.max(1, (this.agentCount / this.worldSize ** 2) * (3 * CELL_SIZE) ** 2)
     a[68] = p.outline
     a[69] = p.brownian ? 1 : 0
     this.device.queue.writeBuffer(this.paramBuffer, 0, a)
@@ -663,6 +750,12 @@ export class Engine {
 
   frame(p) {
     if (!this.agentCount) return
+
+    // Refit the grid when the radii have moved enough to change the cell
+    // count. A no-op on almost every frame; when it fires it costs one small
+    // buffer alloc and new bind groups, which is why the sliders can stay live.
+    const cpr = this.#targetCellsPerRow(p)
+    if (cpr !== this.cellsPerRow) this.#applyCellSize(cpr)
 
     const canvas = this.canvas
     this.#syncCoreSizes(p.coreSizeSpread)
@@ -710,7 +803,9 @@ export class Engine {
         this.forceRunSimHalf ??
         (p.mixT >= 1 ? 'plife' : p.mixT <= 0 ? 'boids' : 'both')
       pass.setPipeline(
-        this.runSimPipelines[`${this.continuousSpecies ? 1 : 0}:${half}`]
+        this.runSimPipelines[
+          `${this.continuousSpecies ? 1 : 0}:${half}:${this.sortedDispatch ? 1 : 0}`
+        ]
       )
       pass.dispatchWorkgroups(agentGroups)
 

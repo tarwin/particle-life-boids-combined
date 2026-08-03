@@ -62,6 +62,13 @@ function close() {
         </p>
       </section>
 
+      <p class="fine credit">
+        Made by
+        <a href="https://tarwin.art/" target="_blank" rel="noopener noreferrer"
+          >Tarwin ↗</a
+        >
+      </p>
+
       <footer>
         <label class="check">
           <input v-model="dismiss" type="checkbox" />
@@ -153,6 +160,11 @@ a:hover {
 .fine {
   font-size: 11.5px;
   color: var(--muted);
+}
+
+.credit {
+  margin: 18px 0 0;
+  text-align: center;
 }
 
 code {

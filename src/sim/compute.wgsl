@@ -145,6 +145,14 @@ override DENS_1_TO_0: bool = true;
 override WANT_BOIDS: bool = true;
 override WANT_PLIFE: bool = true;
 
+// TODO 1a, the cheap half. Thread k simulates agent `indices[k]` — the
+// cell-sorted order — instead of agent k. Adjacent threads then handle
+// spatially adjacent agents, so a workgroup's ~225-read neighbour scans hit
+// the same few cells and come out of cache instead of DRAM. Same math, same
+// per-agent neighbour order, so the simulation is unchanged; only the mapping
+// of threads to agents moves.
+override SORTED_DISPATCH: bool = true;
+
 // ---------------------------------------------------------------- helpers ---
 
 // GLSL-style mod: result always has the sign of y (unlike WGSL's %).
@@ -763,11 +771,11 @@ fn scatter(@builtin(global_invocation_id) gid: vec3u) {
 // ------------------------------------------------------------ simulation ---
 
 @compute @workgroup_size(WG)
-fn runSim(@builtin(global_invocation_id) gid: vec3u,
-          @builtin(workgroup_id) wid: vec3u) {
-    let id = gid.x;
+fn runSim(@builtin(global_invocation_id) gid: vec3u) {
     let agentCount = u32(P.agentsCount);
-    if (id >= agentCount) { return; }
+    if (gid.x >= agentCount) { return; }
+    var id = gid.x;
+    if (SORTED_DISPATCH) { id = indices[gid.x]; }
 
     var pos = inParticles[id].pos;
     var vel = inParticles[id].vel;
@@ -800,9 +808,22 @@ fn runSim(@builtin(global_invocation_id) gid: vec3u,
     let rowHi = u32(myBracket.y) * speciesCount;
     let coreBase = coreSizeBase();
 
-    // 3x3 neighbourhood of cells, wrapping at the world edges.
-    for (var dx = -1; dx <= 1; dx++) {
-        for (var dy = -1; dy <= 1; dy++) {
+    // TODO 1b. Scan however many cells the largest *active* radius needs,
+    // wrapping at the world edges. The engine fits `cellSize` to the radii in
+    // use, so this is normally 3x3 over smaller cells — but deriving the scan
+    // radius here, from the same values the loop bodies test against, means a
+    // slider pushed past the current cell size widens the scan instead of
+    // silently missing neighbours. Cells divide the world exactly (see
+    // #targetCellsPerRow in engine.js), so ceil(R / cellSize) is a sound bound.
+    var maxR = max(P.collisionRadius, P.coreRadius);
+    if (WANT_BOIDS) { maxR = max(maxR, P.boidVisionRadius); }
+    if (WANT_PLIFE) { maxR = max(maxR, P.speciesInteractionRadius); }
+    var scanR = max(i32(ceil(maxR / P.cellSize)), 1);
+    // Never wider than the grid itself, or wrapped cells get scanned twice and
+    // their forces double-counted.
+    scanR = min(scanR, max((cpr - 1) / 2, 1));
+    for (var dx = -scanR; dx <= scanR; dx++) {
+        for (var dy = -scanR; dy <= scanR; dy++) {
             var ncx = (cx + dx) % cpr;
             var ncy = (cy + dy) % cpr;
             if (ncx < 0) { ncx += cpr; }
@@ -915,7 +936,11 @@ fn runSim(@builtin(global_invocation_id) gid: vec3u,
         accel += safeNormalize(-pos) * P.centerAttraction;
     }
 
-    accel += randomDir(id + wid.x, P.movementRandomness);
+    // `id + id / WG` is exactly the old `id + workgroup_id.x` (the workgroup of
+    // thread id, when threads mapped 1:1 to agents). Keeping the formula in
+    // agent terms means the seed — and so every existing preset — is untouched
+    // by SORTED_DISPATCH remapping which thread runs which agent.
+    accel += randomDir(id + id / WG, P.movementRandomness);
     accel = limitVec(accel, P.maxForce);
     accel *= P.movementScaling;
 

@@ -1,11 +1,10 @@
 # TODO — ideas not yet built
 
-What is left: the **optimisation list** (nothing from it is built), **blob
-splitting** (detection and mutation are done — splitting is not), and a
-**rendering styles** section that is all idea and no code.
-
-Optimisations are the cheapest way to make splitting affordable at high agent
-counts, but nothing here is a hard dependency.
+What is left: the **hard half of 1a** (true shared-memory staging — the cheap
+half, sorted dispatch, is built and was most of the win), **1c/1d** (number
+formats and grid format alternatives, both of whose premises should be
+re-measured now that the loop is no longer starved on random reads), and the
+odd rendering idea in section 3.
 
 ## Everything added is opt-in
 
@@ -25,6 +24,25 @@ it cost 6% even when switched off. The fix — a WGSL `override` constant and tw
 pipelines from one source — is the pattern to reuse.
 
 ## Built since this file was written
+
+**Optimisations 1a (cheap half) and 1b** are done — sorted dispatch and
+radius-fitted grid cells; measurements and findings are in their sections
+below. Headline: **−44%** ms/frame at the 25,600 default, **−67%** at 102,400
+agents, both from the dispatch-order change alone, which is one line of WGSL
+plus a pipeline constant. Nothing about the frame schedule changed and the
+simulation is arithmetic-identical, so unlike every feature above there is no
+switch — it is just on. Two process notes:
+
+- The single biggest lesson: **fix locality before believing any
+  bandwidth/ALU-based ranking.** The fit (1b) was predicted at ~2×; after the
+  dispatch fix it measures neutral at default radii. The format ideas (1c)
+  almost certainly deflated the same way.
+- The deterministic Ring + locked-matrix start **never settles** — it kept
+  densifying past 4,000 frames, with per-frame cost tripling across one bench
+  run and per-round ratios swinging −61% to +26%. Spiral + locked matrix +
+  fixed seed settles to a usable plateau in ~2,000 frames; benches here used
+  that, with `settle` driven in chunks beforehand (a long single call outlives
+  the console eval and gets killed, exactly as the bench header warns).
 
 **Phobic / philic — a "medium"** is done; see the *Medium* section of the
 README. It landed close to the design sketched here: a scalar field packed into
@@ -117,32 +135,65 @@ Ranked by expected win. **Formats are not the top of the list.**
 
 ### 1a. Workgroup shared-memory staging — the big one
 
-`runSim` re-reads `inParticles[i]` from global memory for **every** one of
-~225 neighbours, and neighbouring agents in the same workgroup scan mostly the
-same cells. Stage each cell's particles into `var<workgroup>` shared memory
-once, then have the whole workgroup read from there.
+**The cheap half is BUILT, and it was most of the win.** The original sketch
+below assumed staging required restructuring `runSim` around a cell-major
+dispatch. It doesn't: keeping one-thread-one-agent but walking the *sorted*
+order — `id = indices[gid.x]` behind a `SORTED_DISPATCH` override, one extra
+indirection — already puts spatially adjacent agents on adjacent threads, so a
+workgroup's ~225 neighbour reads hit the same few cells in cache instead of
+DRAM. Same math, same per-agent accumulation order, so the simulation is
+unchanged (`randomDir`'s seed was rewritten in agent terms, `id + id/WG`, to
+keep it literally identical). Measured, paired per-round:
 
-The catch: agents in a workgroup are ordered by *index*, not by *cell*, so they
-do not share a neighbourhood. To make staging pay off, the dispatch needs to be
-**cell-major** — i.e. iterate the sorted `indices` list so one workgroup handles
-one cell (or a small block of cells) and its 3×3 halo. That is a restructure of
-`runSim`, not a tweak. Biggest available win; also the most work.
+- **25,600 agents (default world): −44%** ms/frame (−43% to −49% across rounds).
+- **102,400 agents, same world: −67%** (38.9 → 13.3 ms/frame — the win grows
+  with density, as a cache fix should).
 
-### 1b. Size the grid cell to the radii actually in use
+What remains unbuilt is true `var<workgroup>` staging with a cell-major
+dispatch. It is far less attractive now: the gap it can close is whatever DRAM
+traffic survives the L2-friendly ordering, at the cost of the tile-loop
+restructure the sketch describes. Measure the residual before attempting it.
 
-`CELL_SIZE = 500` because the Vision/Sense sliders *can* reach 500. In practice
-they sit at 350 / 250. If `cellSize` were derived per-restart from
-`max(boidVisionRadius, speciesInteractionRadius)`, the scanned area would shrink
-by roughly (350/500)² ≈ **2×**.
+Original sketch: `runSim` re-reads `inParticles[i]` from global memory for
+**every** one of ~225 neighbours, and neighbouring agents in the same workgroup
+scan mostly the same cells. Stage each cell's particles into `var<workgroup>`
+shared memory once, then have the whole workgroup read from there. Agents in a
+workgroup would need to be ordered by cell (they now are), and one workgroup
+would handle one cell's block plus its halo in tiles.
 
-Complication: those two are *live* sliders, but `cellSize` is baked into the
-grid buffer size at restart. Options:
-- Recompute the grid on slider release (a restart-lite that keeps particles).
-- Or clamp the sliders to the current cell size and surface that in the UI.
-- Or (best) decouple: keep a fixed cell size but scan a **variable radius** of
-  cells (1×1 when radii are small relative to cell size, 3×3 otherwise).
+### 1b. Size the grid cell to the radii actually in use — **BUILT**
+
+Both halves of the "(best) decouple" option landed:
+
+- The engine refits `cellSize` to the largest radius the *current pipeline*
+  actually scans (per `frame()`, quantised to a cells-per-row change). The
+  refit is the sketched restart-lite: reallocate the grid buffer, reseed the
+  medium, rebuild bind groups, keep the particles. Cells divide the world
+  **exactly** (`floor` + divide, not `ceil`) — a narrow partial edge cell would
+  break the scan bound below.
+- `runSim` derives its scan radius as `ceil(maxR / cellSize)` from the same
+  radii it tests against, so a slider pushed past the current cell size widens
+  the scan instead of missing neighbours. Correctness never depends on the fit.
+
+Findings, which partly invert the sketch's expectation:
+
+- **With sorted dispatch (1a) in place, the fit is neutral at the default
+  radii** (−0% to −1%). The ~2× candidate reduction it was predicted to give
+  buys nothing once rejected candidates are cache-hits costing one distance
+  test each. Before 1a it would have looked like a win; measure order matters.
+- **It pays where the fixed cell never could: small radii.** At Vision/Sense
+  100 it is **−36%**, because cost now tracks the sliders instead of the
+  worst case the sliders can reach.
+- **Do not chase finer cells.** `cellSize = maxR/2` measured neutral,
+  `maxR/3` measured **+19%** — per-cell bookkeeping (two loads per cell,
+  9→25→49 cells) eats the culling. The fit stays at `cellSize = maxR`.
 
 ### 1c. Number formats
+
+**Re-measure the premise before building any of this.** The bandwidth argument
+below was written when the inner loop's reads were spatially random; after 1a's
+sorted dispatch they mostly come out of cache, and the remaining DRAM traffic
+is a fraction of what f16 was going to halve.
 
 - **f16 is available** via the `shader-f16` device feature and would halve
   neighbour-read bandwidth — which is exactly what the inner loop is bound by.
@@ -165,17 +216,22 @@ grid buffer size at restart. Options:
   right structure; it is what GPU neighbour search converges on.
 - **Morton / Z-order cell indexing** would improve cache locality on the 3×3
   scan (neighbouring cells land near each other in memory instead of one row
-  apart). Cheap to try: change `cellOf()` and the neighbour index math only.
-  Modest win, very low risk.
+  apart). Largely superseded by 1a's sorted dispatch, which gets the locality
+  at the thread level; also no longer "change `cellOf()` only" — the medium,
+  blob and density passes all index cells row-major now and would need the
+  encode/decode too.
 - **Sorting the particle *data* rather than an index list** (a full gather into
   a cell-sorted particle buffer each frame) turns the inner loop's random reads
-  into sequential ones. Costs one extra full-buffer pass; likely worth it above
-  ~400k agents. Pairs naturally with 1a.
+  into sequential ones. Costs one extra full-buffer pass. Same caveat as 1c:
+  the reads it straightens are mostly cache-hits since 1a, so measure the
+  residual first.
 - **`prefixSum` is single-workgroup and will become a bottleneck.** At world
   size 128,000 there are 65,536 cells, so that one workgroup loops 256 blocks
   serially with barriers. Not yet dominant, but it is the first thing that will
   bite if world sizes go up further. Fix is the standard three-pass scan
-  (per-block scan → scan of block sums → add offsets).
+  (per-block scan → scan of block sums → add offsets). Slightly more current
+  since 1b: a fitted grid hits the same 65,536-cell cap at *any* world size
+  when the radii sliders are small (cells-per-row is clamped to 256).
 
 ### 1e. Free-ish wins
 
